@@ -1,0 +1,151 @@
+import machine
+from machine import Pin, I2C, ADC, PWM
+from ssd1306 import SSD1306_I2C
+import utime
+import array
+import time
+
+
+class Fifo:
+    def __init__(self, size, typecode='H'):
+        self.data = array.array(typecode)
+        for i in range(size):
+            self.data.append(0)
+        self.head = 0
+        self.tail = 0
+        self.size = size
+        self.dc = 0
+
+    def put(self, value):
+        nh = (self.head + 1) % self.size
+        if nh != self.tail:
+            self.data[self.head] = value
+            self.head = nh
+        else:
+            self.dc += 1
+            raise RuntimeError("Fifo is full - value dropped")
+
+    def get(self):
+        val = self.data[self.tail]
+        if self.empty():
+            raise RuntimeError("Fifo is empty")
+        else:
+            self.tail = (self.tail + 1) % self.size
+        return val
+
+    def dropped(self):
+        return self.dc
+
+    def has_data(self):
+        return self.head != self.tail
+
+    def empty(self):
+        return self.head == self.tail
+
+# Event codes 
+
+EV_CW    = 1   
+EV_CCW   = 2   
+EV_PRESS = 3   
+
+event_fifo = Fifo(16)
+
+C_LEFT   = 10
+C_RIGHT  = 11
+C_SWITCH = 12
+
+p1 = Pin(C_LEFT,   Pin.IN)              
+p2 = Pin(C_RIGHT,  Pin.IN)              
+p3 = Pin(C_SWITCH, Pin.IN, Pin.PULL_UP) 
+
+LED_PINS = [
+    Pin(2, Pin.OUT),   
+    Pin(3, Pin.OUT),   
+    Pin(4, Pin.OUT),  
+]
+
+_clk_last    = p1.value()
+_last_btn_ms = 0
+DEBOUNCE_MS  = 50
+
+# Interrupt handlers 
+
+def encoder_turn_isr(pin):
+    global _clk_last
+    clk_val = p1.value()
+    if clk_val != _clk_last:
+        _clk_last = clk_val
+        if clk_val == 0:               # falling edge = one detent
+            try:
+                if p2.value():         # DT high → CW  (cursor down)
+                    event_fifo.put(EV_CW)
+                else:                  # DT low  → CCW (cursor up)
+                    event_fifo.put(EV_CCW)
+            except RuntimeError:
+                pass                   # fifo full; event dropped
+
+
+def encoder_btn_isr(pin):
+    global _last_btn_ms
+    now = time.ticks_ms()
+    if time.ticks_diff(now, _last_btn_ms) >= DEBOUNCE_MS:
+        _last_btn_ms = now
+        try:
+            event_fifo.put(EV_PRESS)
+        except RuntimeError:
+            pass                       # fifo full; event dropped
+
+
+p1.irq(trigger=Pin.IRQ_FALLING | Pin.IRQ_RISING, handler=encoder_turn_isr)
+p3.irq(trigger=Pin.IRQ_FALLING,                  handler=encoder_btn_isr)
+
+
+
+NUM_LEDS   = len(LED_PINS)
+led_states = [False] * NUM_LEDS   
+cursor     = 0                    
+
+
+
+def render_menu():
+    print()
+    for i in range(NUM_LEDS):
+        selected  = (i == cursor)
+        state_str = "ON " if led_states[i] else "OFF"
+        bracket_l = "[" if selected else " "
+        bracket_r = "]" if selected else " "
+        print(f" {bracket_l}LED{i + 1} - {state_str}{bracket_r}")
+
+
+def apply_led_states():
+    for i, pin in enumerate(LED_PINS):
+        pin.value(1 if led_states[i] else 0)
+
+
+# Main loop
+
+print("=== Rotary Encoder LED Menu ===")
+render_menu()
+
+while True:
+    if not event_fifo.has_data():
+        time.sleep_ms(5)
+        continue
+
+    event = event_fifo.get()
+
+    if event == EV_CW:
+        cursor = (cursor + 1) % NUM_LEDS
+        render_menu()
+
+    elif event == EV_CCW:
+        cursor = (cursor - 1) % NUM_LEDS
+        render_menu()
+
+    elif event == EV_PRESS:
+        led_states[cursor] = not led_states[cursor]
+        apply_led_states()
+        render_menu()
+
+    if event_fifo.dropped() > 0:
+        print(f"[WARN] {event_fifo.dropped()} event(s) dropped by fifo")
