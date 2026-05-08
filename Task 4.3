@@ -1,0 +1,217 @@
+import array
+import machine
+from machine import Pin, I2C, ADC
+from ssd1306 import SSD1306_I2C
+import utime
+
+class Fifo:
+    """Interrupt safe fifo implementation
+    Buffer used for storage is allocated when the object is instantiated.
+    Methods don't allocate memory.
+    Typecode specifies the type of stored values as defined in array
+    When used from ISR, the ISR should call put() to add data to fifo and
+    the main program must read data from fifo by calling get() often enough
+    to prevent fifo from getting full.
+    """
+    def __init__(self, size, typecode = 'H'):
+        """Parameters
+
+        size (int): Fifo size. The maximum number of items stored is one less than the given size
+        typecode (char): Type of data stored in fifo. (Default is 'H' - unsigned short)
+        """        
+        self.data = array.array(typecode)
+        for i in range(size):
+            self.data.append(0)
+        self.head = 0
+        self.tail = 0
+        self.size = size
+        self.dc = 0
+        
+    def put(self, value):
+        """Put one item into the fifo. Raises an exception if the fifo is full."""
+        nh = (self.head + 1) % self.size
+        if nh != self.tail:
+            self.data[self.head] = value
+            self.head = nh
+        else:
+            self.dc = self.dc + 1
+            raise RuntimeError("Fifo is full - value dropped")
+            
+    def get(self):
+        """Get one item from the fifo. If the fifo is empty raises an exception and returns the last value."""
+        val = self.data[self.tail]
+        if self.empty():
+            raise RuntimeError("Fifo is empty")
+        else:
+            self.tail = (self.tail + 1) % self.size
+        return val
+    
+    def dropped(self):
+        """Return number of dropped items. A return value that is greater than zero means that fifo is emptied too slowly.""" 
+        return self.dc
+
+    def has_data(self):
+        """Returns True if there is data in the fifo"""
+        return self.head != self.tail
+                
+    def empty(self):
+        """Returns True if the fifo is empty"""
+        return self.head == self.tail
+
+
+
+class Filefifo:
+    """Mock version of Interrupt safe fifo implementation
+    This mock version implements an interface that is identical to
+    the real fifo except for the constructor which takes up to two additional
+    parameters. The mock version is for testing data processing
+    without actually using interrupts. Instead of creating a buffer for data
+    the mock fifo reads data from a file. Method put is a dummy function that
+    exists for sake of compatibility.
+    """
+    def __init__(self, size, typecode = 'H', name = 'data.txt', repeat = True):
+        """Parameters
+        size (integer): Not used - fifo size in the real implementation
+        typecode(string): Not used - type of stored values in real implementation
+        name (string): Name of the file to read data from. 
+        repeat (boolean): End of file behaviour. True means start over from beginning.
+        """        
+        self._file  = open(name)
+        self._repeat = repeat
+        
+    def put(self, value):
+        """Put one item into the fifo. In the mock this function does nothing since data comes from a file."""
+        pass
+
+    def get(self):
+        """Get one item from the fifo. If repeat is set to False and file ends raises an exception and returns the last value."""
+        value = -1
+        fail = False
+        str = self._file.readline()
+        if len(str) > 0:
+            value = int(str)
+        else:
+            if self._repeat:
+                self._file.seek(0)
+                str = self._file.readline()
+                if len(str) > 0:
+                    value = int(str)
+                else:
+                    fail = True
+            else:
+                fail = True
+        if fail:
+            raise RuntimeError("Out of data")
+
+        return value
+    
+    def dropped(self):
+        """Return number of dropped items. Mock always returns zero."""
+        return 0
+       
+    def has_data(self):
+        """Returns True if there is data in the fifo. Mock always returns True."""
+        return True
+                
+    def empty(self):
+        """Returns True if the fifo is empty. Mock always returns False."""
+        return False
+
+i2c = I2C(1, scl=Pin(15), sda=Pin(14), freq=400000)
+oled = SSD1306_I2C(128, 64, i2c) 
+
+
+SW_2 = 7
+SW_1 = 8
+SW_0 = 9
+
+
+but0 = Pin(SW_0, Pin.IN, Pin.PULL_UP)
+but1 = Pin(SW_1, Pin.IN, Pin.PULL_UP)
+but2 = Pin(SW_2, Pin.IN, Pin.PULL_UP)
+
+
+C_LEFT = 10
+C_RIGHT = 11
+
+
+p1 = Pin(C_LEFT, Pin.IN)
+p2 = Pin(C_RIGHT, Pin.IN)
+
+
+encoder = Fifo(30)
+data = Filefifo(10, name="capture01_250Hz.txt")
+data_list2 = []
+activate = False
+
+
+def read_data():
+    data_list = []
+    for i in range(1800):
+        data_list.append(data.get())
+    
+    
+    data_list2 = []
+    for i in range(0, 1800, 5):
+        total = 0
+        for j in range(i, i + 5):
+            total += data_list[j]
+        average = total / 5
+        data_list2.append(average)
+    return data_list2
+        
+
+data_list2 = read_data()
+
+x = 0
+y = 0
+start = 0
+offset = min(data_list2)
+print(offset)
+scale = 0.002
+def show():
+    global activate 
+    if activate == True:
+        oled.fill(0)
+        for x in range(128):
+            i = start + x
+            if i >= len(data_list2):
+                break
+            value = data_list2[i]
+            y = int((value - offset) * scale)
+            y = 63 - y
+            # print(x, y, data_list2[i])
+            oled.pixel(x, y, 1)
+
+        oled.show()
+    elif activate == False:
+        oled.fill(0)
+        oled.text("Press SW1", 26, 30)
+        oled.show()
+
+last_time = 0
+debounce_ms = 5
+
+def rotary_encoder(pin):
+    b = p2.value()
+    if b == 1:
+        encoder.put(1)
+    else:
+        encoder.put(2)
+    
+p1.irq(rotary_encoder, Pin.IRQ_FALLING)
+
+
+while True:
+    show()
+    if but1.value() == 0:
+        activate = not activate
+        print("button clicked")
+        utime.sleep(0.05)
+    if encoder.has_data():
+        event = encoder.get()
+        if event == 1:
+            print("turned right")
+        elif event == 2:
+            print("turned left")
+    
